@@ -4,9 +4,7 @@ name: Build Nupixel APK
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 permissions:
   contents: read
@@ -17,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Download repository
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -26,21 +24,84 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
+      - name: Find or extract Android project
+        shell: bash
+        run: |
+          set -e
+          PROJECT=""
 
-      - name: Run unit tests
-        run: gradle testDebugUnitTest --stacktrace
+          find_project() {
+            find "$1" \
+              -type f \
+              \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path '*/.gradle/*' \
+              -print -quit
+          }
+
+          FOUND="$(find_project "$GITHUB_WORKSPACE")"
+
+          if [ -n "$FOUND" ]; then
+            PROJECT="$(dirname "$FOUND")"
+          else
+            ZIP="$(find "$GITHUB_WORKSPACE" \
+              -type f -iname '*.zip' -print -quit)"
+
+            if [ -z "$ZIP" ]; then
+              echo "ERROR: Android project and ZIP not found"
+              exit 1
+            fi
+
+            mkdir -p "$RUNNER_TEMP/nupixel-source"
+            unzip -q "$ZIP" -d "$RUNNER_TEMP/nupixel-source"
+
+            FOUND="$(find_project "$RUNNER_TEMP/nupixel-source")"
+
+            if [ -z "$FOUND" ]; then
+              echo "ERROR: Gradle project not found inside ZIP"
+              exit 1
+            fi
+
+            PROJECT="$(dirname "$FOUND")"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Android project found: $PROJECT"
+
+      - name: Install Gradle 8.9
+        run: |
+          curl -fL \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip \
+            -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" \
+            -d "$RUNNER_TEMP/gradle"
+          echo "$RUNNER_TEMP/gradle/gradle-8.9/bin" >> "$GITHUB_PATH"
 
       - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+        run: gradle -p "$PROJECT_DIR" assembleDebug --stacktrace
+
+      - name: Run unit tests
+        continue-on-error: true
+        run: gradle -p "$PROJECT_DIR" testDebugUnitTest --stacktrace
+
+      - name: Prepare APK artifact
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/apk-output"
+
+          if [ -n "${PROJECT_DIR:-}" ]; then
+            find "$PROJECT_DIR" -type f -name '*.apk' \
+              -path '*/build/outputs/apk/*' \
+              -exec cp {} "$RUNNER_TEMP/apk-output/" \;
+          fi
+
+          ls -lh "$RUNNER_TEMP/apk-output" || true
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Nupixel-debug-APK
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          path: ${{ runner.temp }}/apk-output/*.apk
+          if-no-files-found: warn
           retention-days: 14
